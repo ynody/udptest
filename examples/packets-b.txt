@@ -1,0 +1,4 @@
+# Server B から Server A への試験パケット
+CA FE BA BE
+/Wait 100
+10203040

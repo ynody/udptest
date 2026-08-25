@@ -1,0 +1,7 @@
+{
+  "listen_address": "127.0.0.1",
+  "listen_port": 5000,
+  "destination_address": "127.0.0.1",
+  "destination_port": 5001,
+  "ipc_port": 6000
+}

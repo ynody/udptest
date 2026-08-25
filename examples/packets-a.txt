@@ -1,0 +1,4 @@
+# Server A から Server B への試験パケット
+DE AD BE EF
+/Wait 100
+01020304
