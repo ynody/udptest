@@ -163,9 +163,14 @@ class UdpService {
   template <typename CompletionHandler>
   void send(std::shared_ptr<std::vector<std::uint8_t>> payload,
             CompletionHandler&& completion_handler) {
+    // 関数引数の評価順序に依存しないよう、所有権をラムダへ移す前に
+    // バッファを作成する。これにより、`std::move(payload)` が先に評価されて
+    // 空になったshared_ptrを参照することを防ぐ。
+    const auto payload_buffer = asio::buffer(*payload);
+
     // 非同期送信の完了までペイロードを保持する。
     socket_.async_send_to(
-        asio::buffer(*payload), destination_,
+        payload_buffer, destination_,
         [payload = std::move(payload),
          completion_handler = std::forward<CompletionHandler>(completion_handler)](
             const asio::error_code& error, const std::size_t bytes_sent) mutable {

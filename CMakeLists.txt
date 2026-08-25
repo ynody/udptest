@@ -40,6 +40,8 @@ else()
 endif()
 
 if(WIN32)
+  # Asio が既定のターゲットOSバージョンを推測しないよう、Windows 7以降を明示する。
+  target_compile_definitions(udpcomapp_options INTERFACE _WIN32_WINNT=0x0601)
   target_link_libraries(udpcomapp_options INTERFACE ws2_32 mswsock)
 endif()
 
