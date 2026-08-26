@@ -48,4 +48,25 @@ udp_server <設定JSONファイル>
 udp_sender <設定JSONファイル> <UDPペイロードファイル>
 ```
 
+## 5. パケットログ出力の設定
+
+`udp_server` は、受信パケットのサイズと通し番号を標準出力へ表示し、全ペイロードのhexダンプをテキストログファイルへ記録する。出力先と出力待ちキューの上限は、サーバの設定JSONに任意で指定できる。
+
+```json
+{
+  "listen_address": "127.0.0.1",
+  "listen_port": 5000,
+  "destination_address": "192.0.2.10",
+  "destination_port": 5001,
+  "ipc_port": 6000,
+  "packet_log_path": "logs/received.log",
+  "packet_log_queue_limit_bytes": 8388608
+}
+```
+
+- `packet_log_path` は受信パケットログの出力先である。相対パスは設定JSONファイルの配置ディレクトリを基準に解決する。指定したファイルが既にある場合は追記する。省略時は、設定JSONと同じディレクトリに `udp_packets_YYYYMMDD-HHMMSS-mmm.log` 形式の新規ファイルを自動生成する。
+- `packet_log_queue_limit_bytes` は、出力待ちキューに保持するUDPペイロード合計の上限バイト数である。省略時は8 MiB（`8388608`）を使用する。出力処理が受信より遅く上限に達した場合、保留中の画面・ファイル記録を破棄して `warn` ログを出力するが、UDP受信処理は継続する。
+
+ログファイルを作成または追記できない場合、サーバは起動時にエラーを表示して終了する。ログファイルのローテーションは行わない。
+
 localhost での双方向通信の再現試験は、[ローカル組み合わせ試験手順](testing.md) を参照する。
