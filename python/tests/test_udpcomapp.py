@@ -9,6 +9,7 @@ import sys
 import threading
 import tempfile
 import time
+from unittest.mock import patch
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -27,8 +28,10 @@ from udpcomapp import (  # noqa: E402
     main,
     parse_payload_line,
     parse_send_path,
+    scan_path_candidates,
 )
 from textual.containers import Grid  # noqa: E402
+from textual.widgets import OptionList  # noqa: E402
 
 
 def free_udp_port() -> int:
@@ -83,6 +86,38 @@ class PayloadParserTests(unittest.TestCase):
         self.assertEqual(parse_send_path("send '  spaced name.txt  '"), Path("  spaced name.txt  "))
         with self.assertRaisesRegex(ValueError, "unmatched quote"):
             parse_send_path('send "unfinished')
+
+    def test_path_completion_quotes_hidden_names_and_dot_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            (base / "alpha one.txt").touch()
+            (base / ".secret").touch()
+            (base / "folder space").mkdir()
+            (base / " spaced file ").touch()
+
+            plain = scan_path_candidates("al", "send ", None, base)
+            self.assertEqual([item.value for item in plain.candidates], ["send alpha one.txt"])
+            quoted = scan_path_candidates("fol", 'send ', '"', base)
+            self.assertEqual(quoted.candidates[0].value, 'send "folder space/')
+            self.assertTrue(quoted.candidates[0].is_directory)
+            empty = scan_path_candidates("", "send ", None, base)
+            self.assertIn("alpha one.txt", [item.label for item in empty.candidates])
+            self.assertFalse(any(item.label == ".secret" for item in empty.candidates))
+            spaced = next(item for item in empty.candidates if item.label == " spaced file ")
+            self.assertEqual(spaced.value, 'send " spaced file "')
+            self.assertEqual(parse_send_path(spaced.value), Path(" spaced file "))
+            self.assertEqual(scan_path_candidates(".s", "send ", None, base).candidates[0].label, ".secret")
+            self.assertEqual(scan_path_candidates(".", "send ", None, base).candidates[0].value, "send ./")
+            self.assertEqual(scan_path_candidates("..", "send ", None, base).candidates[0].value, "send ../")
+
+            many = base / "many"
+            many.mkdir()
+            for index in range(205):
+                (many / f"item-{index:03}.txt").touch()
+            capped = scan_path_candidates("many/", "send ", None, base)
+            self.assertEqual(len(capped.candidates), 200)
+            self.assertTrue(capped.truncated)
+            self.assertEqual(capped.candidates[0].label, "item-000.txt")
 
 
 class ConfigurationTests(unittest.TestCase):
@@ -370,6 +405,185 @@ class RuntimeLoopbackTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TextualPilotTests(unittest.IsolatedAsyncioTestCase):
+    async def test_command_history_completion_selection_and_quoted_directory_walk(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            (directory / "alpha one.txt").write_text("CAFE\n", encoding="utf-8")
+            (directory / "alpha-two.txt").write_text("BEEF\n", encoding="utf-8")
+            nested = directory / "folder space"
+            nested.mkdir()
+            (nested / "child one.txt").write_text("ABCD\n", encoding="utf-8")
+            (nested / "child-two.txt").write_text("1234\n", encoding="utf-8")
+            dense = directory / "dense"
+            dense.mkdir()
+            for index in range(12):
+                (dense / f"item-{index:02}.txt").touch()
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as destination:
+                destination.bind(("127.0.0.1", 0))
+                settings_path = write_settings(directory, destination.getsockname()[1])
+                runtime = create_runtime(settings_path)
+                app = UDPApp(runtime, completion_base=directory)
+                for index in range(105):
+                    app._record_command_history(f"cmd {index}")
+                app._record_command_history("cmd 104")
+                self.assertEqual(len(app._history), 100)
+                self.assertEqual(app._history[0], "cmd 5")
+                app._history.clear()
+                try:
+                    async with app.run_test(size=(110, 35)) as pilot:
+                        command = app.query_one("#command-input")
+                        option_list = app.query_one("#completion-list", OptionList)
+
+                        command.value = "status"
+                        await pilot.press("enter")
+                        await pilot.pause(0.02)
+                        command.value = "status"
+                        await pilot.press("enter")
+                        await pilot.pause(0.02)
+                        command.value = "help"
+                        await pilot.press("enter")
+                        await pilot.pause(0.02)
+                        self.assertEqual(app._history, ["status", "help"])
+
+                        command.value = "send unsubmitted draft"
+                        await pilot.press("up")
+                        self.assertEqual(command.value, "help")
+                        await pilot.press("up")
+                        self.assertEqual(command.value, "status")
+                        await pilot.press("down")
+                        self.assertEqual(command.value, "help")
+                        await pilot.press("down")
+                        self.assertEqual(command.value, "send unsubmitted draft")
+
+                        command.value = "send al"
+                        command.cursor_position = len(command.value)
+                        self.assertTrue(await wait_until(lambda: bool(command._suggestion)))
+                        self.assertEqual(command._suggestion, "send alpha one.txt")
+                        command.cursor_position -= 1
+                        self.assertEqual(command._suggestion, "")
+                        command.cursor_position = len(command.value)
+                        self.assertTrue(await wait_until(lambda: bool(command._suggestion)))
+                        await pilot.press("right")
+                        self.assertEqual(command.value, "send alpha one.txt")
+
+                        command.value = "send al"
+                        command.cursor_position = len(command.value)
+                        await pilot.press("tab")
+                        self.assertTrue(await wait_until(lambda: app._completion_mode))
+                        self.assertEqual(len(app._completion_candidates), 2)
+                        self.assertEqual(option_list.highlighted, 0)
+                        self.assertTrue(command.has_focus)
+                        destination.sendto(b"RX", runtime.sock.getsockname())
+                        self.assertTrue(await wait_until(lambda: runtime.snapshot()["received"] == 1))
+                        await pilot.pause(0.15)
+                        self.assertTrue(app._completion_mode)
+                        self.assertEqual(command.value, "send al")
+                        await pilot.press("down")
+                        self.assertEqual(option_list.highlighted, 1)
+                        self.assertEqual(command.value, "send al")
+                        self.assertIsNone(app._history_index)
+                        await pilot.press("enter")
+                        self.assertEqual(command.value, "send alpha-two.txt")
+                        self.assertFalse(app._completion_mode)
+                        self.assertEqual(runtime.sender.snapshot()["queued"], 0)
+                        self.assertEqual(runtime.sender.snapshot()["completed"], 0)
+
+                        command.value = "send al"
+                        command.cursor_position = len(command.value)
+                        await pilot.press("tab")
+                        self.assertTrue(await wait_until(lambda: app._completion_mode))
+                        command.value = "send fo"
+                        command.cursor_position = len(command.value)
+                        self.assertTrue(await wait_until(lambda: app._completion_value == "send fo"))
+                        self.assertEqual([candidate.label for candidate in app._completion_candidates], ["folder space/"])
+                        await pilot.press("escape")
+                        self.assertEqual(command.value, "send fo")
+
+                        command.value = "send dense/"
+                        command.cursor_position = len(command.value)
+                        await pilot.press("tab")
+                        self.assertTrue(await wait_until(lambda: app._completion_mode))
+                        self.assertEqual(len(app._completion_candidates), 12)
+                        # Two border rows leave eight candidate rows visible under the ten-row cap.
+                        self.assertEqual(option_list.region.height, 10)
+                        self.assertEqual(option_list.scrollable_content_region.height, 8)
+                        for _ in range(9):
+                            await pilot.press("down")
+                        self.assertEqual(option_list.highlighted, 9)
+                        await pilot.press("escape")
+
+                        command.value = 'send "fol'
+                        command.cursor_position = len(command.value)
+                        await pilot.press("tab")
+                        self.assertTrue(await wait_until(lambda: command.value == 'send "folder space/'))
+                        self.assertFalse(app._completion_mode)
+                        command.value = 'send "folder space/ch'
+                        command.cursor_position = len(command.value)
+                        await pilot.press("tab")
+                        self.assertTrue(await wait_until(lambda: app._completion_mode))
+                        self.assertEqual(len(app._completion_candidates), 2)
+                        await pilot.press("down")
+                        await pilot.press("enter")
+                        self.assertEqual(command.value, 'send "folder space/child-two.txt"')
+                        self.assertEqual(runtime.sender.snapshot()["queued"], 0)
+
+                        command.value = "send al"
+                        command.cursor_position = len(command.value)
+                        await pilot.press("tab")
+                        self.assertTrue(await wait_until(lambda: app._completion_mode))
+                        await pilot.press("escape")
+                        self.assertFalse(app._completion_mode)
+                        self.assertEqual(command.value, "send al")
+                        self.assertEqual(option_list.styles.display, "none")
+                        await pilot.press("up")
+                        self.assertEqual(command.value, "help")
+                        await pilot.press("down")
+                        self.assertEqual(command.value, "send al")
+                        command.value = "quit"
+                        await pilot.press("enter")
+                finally:
+                    runtime.shutdown()
+
+    async def test_escape_invalidates_a_slow_completion_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            (directory / "alpha.txt").touch()
+            (directory / "alpine.txt").touch()
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as destination:
+                destination.bind(("127.0.0.1", 0))
+                settings_path = write_settings(directory, destination.getsockname()[1])
+                runtime = create_runtime(settings_path)
+                app = UDPApp(runtime, completion_base=directory)
+                entered = threading.Event()
+                release = threading.Event()
+                original_scan = scan_path_candidates
+
+                def slow_scan(*args: object) -> object:
+                    entered.set()
+                    release.wait(2)
+                    return original_scan(*args)  # type: ignore[arg-type]
+
+                try:
+                    async with app.run_test(size=(100, 30)) as pilot:
+                        command = app.query_one("#command-input")
+                        command.suggester = None
+                        command.value = "send al"
+                        command.cursor_position = len(command.value)
+                        with patch("udpcomapp.scan_path_candidates", side_effect=slow_scan):
+                            await pilot.press("tab")
+                            self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+                            await pilot.press("escape")
+                            release.set()
+                            await pilot.pause(0.1)
+                        self.assertFalse(app._completion_mode)
+                        self.assertEqual(command.value, "send al")
+                        self.assertEqual(app.query_one("#completion-list", OptionList).styles.display, "none")
+                        command.value = "quit"
+                        await pilot.press("enter")
+                finally:
+                    release.set()
+                    runtime.shutdown()
+
     async def test_packet_writer_fatal_is_logged_and_shown_before_exit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)

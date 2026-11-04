@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import bisect
 import collections
 import ipaddress
 import json
@@ -21,8 +22,11 @@ from pathlib import Path
 from typing import Callable, TextIO
 
 from textual.app import App, ComposeResult
-from textual.containers import Grid, VerticalScroll
-from textual.widgets import Footer, Header, Input, Label, Static
+from textual.binding import Binding
+from textual.containers import Grid, Vertical, VerticalScroll
+from textual.suggester import Suggester
+from textual.widgets import Footer, Header, Input, Label, OptionList, Static
+from textual.widgets.option_list import Option
 
 
 MAX_PAYLOAD_SIZE = 32_768
@@ -35,6 +39,8 @@ MAX_WAIT_MS = 1_800_000
 FLUSH_INTERVAL_SECONDS = 1.0
 FLUSH_LINE_COUNT = 256
 UI_MAX_EVENTS = 100
+COMMAND_HISTORY_LIMIT = 100
+COMPLETION_OPTION_LIMIT = 200
 UI_REFRESH_INTERVAL = 0.1
 EVENT_LOG_QUEUE_LIMIT = 4_096
 _EVENT_WAKE = object()
@@ -676,6 +682,228 @@ def parse_send_path(command: str) -> Path:
 
 
 @dataclass(frozen=True)
+class CompletionCandidate:
+    value: str
+    label: str
+    is_directory: bool
+
+
+@dataclass(frozen=True)
+class CompletionResults:
+    candidates: tuple[CompletionCandidate, ...]
+    truncated: bool = False
+
+
+@dataclass(frozen=True)
+class CompletionQuery:
+    command_prefix: str
+    path_text: str
+    quote: str | None
+
+
+def parse_completion_query(value: str) -> CompletionQuery | None:
+    """Return the send path being edited, if the whole input is a completable send."""
+    if not value.startswith("send") or len(value) == 4 or not value[4].isspace():
+        return None
+    path_start = 4
+    while path_start < len(value) and value[path_start].isspace():
+        path_start += 1
+    raw_path = value[path_start:]
+    command_prefix = value[:path_start]
+    quote: str | None = None
+    if raw_path.startswith(("'", '"')):
+        quote = raw_path[0]
+        if len(raw_path) > 1 and raw_path[-1] == quote:
+            # A closed quoted path is already complete; a trailing quote in an
+            # unquoted path is invalid according to parse_send_path as well.
+            return None
+        path_text = raw_path[1:]
+    else:
+        if raw_path.endswith(("'", '"')):
+            return None
+        # Unquoted send paths are trimmed at submission time.
+        path_text = raw_path.strip()
+    return CompletionQuery(command_prefix, path_text, quote)
+
+
+def scan_path_candidates(path_text: str, command_prefix: str, quote: str | None, base: Path) -> CompletionResults:
+    """Scan a directory for matching send paths. Call from a worker thread."""
+    separators = {os.sep}
+    if os.altsep:
+        separators.add(os.altsep)
+    has_trailing_separator = bool(path_text) and path_text[-1] in separators
+
+    if path_text in (".", ".."):
+        directory_path = base if path_text == "." else base.parent
+        if directory_path.is_dir():
+            completed_path = "./" if path_text == "." else "../"
+            completed_value = f"{command_prefix}{quote or ''}{completed_path}"
+            candidate = CompletionCandidate(completed_value, completed_path, True)
+            return CompletionResults((candidate,))
+
+    if not path_text:
+        directory_part = Path(".")
+        typed_directory = ""
+        name_prefix = ""
+    elif has_trailing_separator:
+        directory_part = Path(path_text)
+        typed_directory = path_text
+        name_prefix = ""
+    else:
+        path = Path(path_text)
+        name_prefix = path.name
+        directory_part = path.parent
+        typed_directory = path_text[: len(path_text) - len(name_prefix)] if name_prefix else path_text
+
+    directory = directory_part if directory_part.is_absolute() else base / directory_part
+    include_hidden = name_prefix.startswith(".")
+    case_sensitive = os.name != "nt"
+    candidates: list[tuple[str, str, CompletionCandidate]] = []
+    retained_limit = COMPLETION_OPTION_LIMIT + 1
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                name = entry.name
+                if not include_hidden and name.startswith("."):
+                    continue
+                matches = name.startswith(name_prefix) if case_sensitive else name.casefold().startswith(name_prefix.casefold())
+                if not matches:
+                    continue
+                name_key = (name.casefold(), name)
+                if len(candidates) >= retained_limit and name_key >= candidates[-1][:2]:
+                    continue
+                try:
+                    is_directory = entry.is_dir(follow_symlinks=True)
+                    is_file = entry.is_file(follow_symlinks=True)
+                except OSError:
+                    continue
+                if not is_directory and not is_file:
+                    continue
+                suffix = "/" if is_directory else ""
+                completed_path = f"{typed_directory}{name}{suffix}"
+                if quote:
+                    if quote in completed_path:
+                        continue
+                    completed_value = f"{command_prefix}{quote}{completed_path}"
+                    if not is_directory:
+                        completed_value += quote
+                else:
+                    needs_quotes = (
+                        completed_path != completed_path.strip()
+                        or completed_path.startswith(("'", '"'))
+                        or completed_path.endswith(("'", '"'))
+                    )
+                    if needs_quotes:
+                        candidate_quote = next((mark for mark in ('"', "'") if mark not in completed_path), None)
+                        if candidate_quote is None:
+                            continue
+                        completed_value = f"{command_prefix}{candidate_quote}{completed_path}"
+                        if not is_directory:
+                            completed_value += candidate_quote
+                    else:
+                        completed_value = f"{command_prefix}{completed_path}"
+                candidate = CompletionCandidate(completed_value, f"{name}{suffix}", is_directory)
+                bisect.insort(candidates, (name_key[0], name_key[1], candidate))
+                if len(candidates) > retained_limit:
+                    candidates.pop()
+    except OSError:
+        return CompletionResults(())
+
+    truncated = len(candidates) > COMPLETION_OPTION_LIMIT
+    return CompletionResults(tuple(item[2] for item in candidates[:COMPLETION_OPTION_LIMIT]), truncated)
+
+
+class SendPathSuggester(Suggester):
+    """Provides the first matching path as Textual's inline completion."""
+
+    def __init__(self, app: UDPApp, base: Path) -> None:
+        super().__init__(use_cache=False, case_sensitive=True)
+        self._app = app
+        self._base = base
+
+    async def get_suggestion(self, value: str) -> str | None:
+        query = parse_completion_query(value)
+        if query is None or not self._app._can_inline_complete(value):
+            return None
+        results = await asyncio.to_thread(
+            scan_path_candidates,
+            query.path_text,
+            query.command_prefix,
+            query.quote,
+            self._base,
+        )
+        if not self._app._can_inline_complete(value) or not results.candidates:
+            return None
+        suggestion = results.candidates[0].value
+        return None if suggestion == value else suggestion
+
+
+class CommandInput(Input):
+    """Input with command history and completion-mode navigation keys."""
+
+    BINDINGS = [
+        *Input.BINDINGS,
+        Binding("up", "cursor_up", "Previous command or completion", show=False, priority=True),
+        Binding("down", "cursor_down", "Next command or completion", show=False, priority=True),
+        Binding("tab", "completion_tab", "Complete path", show=False, priority=True),
+        Binding("escape", "completion_escape", "Cancel completion", show=False, priority=True),
+    ]
+
+    def _watch_selection(self, selection: object) -> None:
+        super()._watch_selection(selection)
+        suggester = getattr(self, "suggester", None)
+        if not self.cursor_at_end:
+            self._suggestion = ""
+        elif suggester is not None and self.value:
+            self.run_worker(suggester._get_suggestion(self, self.value))
+
+    async def action_submit(self) -> None:
+        app = self.app
+        if isinstance(app, UDPApp) and app._completion_mode:
+            app._accept_completion()
+            return
+        await super().action_submit()
+
+    def action_cursor_right(self, select: bool = False) -> None:
+        app = self.app
+        if isinstance(app, UDPApp) and app._completion_mode and not select:
+            app._accept_completion()
+            return
+        super().action_cursor_right(select)
+
+    def action_completion_tab(self) -> None:
+        if isinstance(self.app, UDPApp):
+            if self.app._completion_mode:
+                self.app._accept_completion()
+            else:
+                self.app._request_completion_from_tab()
+
+    def action_completion_escape(self) -> None:
+        if isinstance(self.app, UDPApp):
+            self.app._cancel_completion()
+
+    def action_cursor_up(self) -> None:
+        if isinstance(self.app, UDPApp):
+            if self.app._completion_mode:
+                self.app._move_completion(-1)
+            else:
+                self.app._history_up()
+
+    def action_cursor_down(self) -> None:
+        if isinstance(self.app, UDPApp):
+            if self.app._completion_mode:
+                self.app._move_completion(1)
+            else:
+                self.app._history_down()
+
+
+class CompletionOptionList(OptionList):
+    """Candidate display that never takes focus away from the command prompt."""
+
+    can_focus = False
+
+
+@dataclass(frozen=True)
 class SendJob:
     path: Path
 
@@ -1142,6 +1370,7 @@ def create_runtime(settings_path: str | Path) -> Runtime:
 
 class UDPApp(App[None]):
     TITLE = "UDP Communication"
+    # A ten-row outer height leaves eight option rows inside OptionList's border.
     CSS = """
     Screen { layout: vertical; }
     #connection { height: auto; padding: 0 1; }
@@ -1150,19 +1379,38 @@ class UDPApp(App[None]):
     #status-panel { width: 1fr; }
     #events-panel { width: 2fr; }
     #status-text, #event-list { width: 1fr; height: auto; }
-    #command-input { dock: bottom; }
+    #command-area { dock: bottom; height: auto; width: 100%; }
+    #completion-list {
+        width: 100%;
+        height: auto;
+        max-height: 10;
+        display: none;
+        border: round $accent;
+        background: $surface;
+    }
     """
 
     BINDINGS = [("ctrl+c", "quit_app", "Quit")]
 
-    def __init__(self, runtime: Runtime) -> None:
+    def __init__(self, runtime: Runtime, *, completion_base: Path | None = None) -> None:
         super().__init__()
         self.runtime = runtime
+        self._completion_base = (completion_base or Path.cwd()).resolve()
+        self._suggester = SendPathSuggester(self, self._completion_base)
         self._udpcomapp_return_code = 0
         self._fatal_shutdown_started = False
         self._visible_events: collections.deque[str] = collections.deque(maxlen=UI_MAX_EVENTS)
         self._last_receive_row: str | None = None
         self._last_receive_count = 0
+        self._history: list[str] = []
+        self._history_index: int | None = None
+        self._history_draft = ""
+        self._completion_mode = False
+        self._completion_request_id = 0
+        self._pending_tab_value: str | None = None
+        self._completion_value: str | None = None
+        self._completion_candidates: tuple[CompletionCandidate, ...] = ()
+        self._completion_truncated = False
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -1174,7 +1422,13 @@ class UDPApp(App[None]):
             with VerticalScroll(id="events-panel"):
                 yield Label("Recent events (up to 100)", id="events-heading")
                 yield Static("", id="event-list", markup=False)
-        yield Input(placeholder="send <file-path> | status | help | resume | quit", id="command-input")
+        with Vertical(id="command-area"):
+            yield CompletionOptionList(id="completion-list", markup=False)
+            yield CommandInput(
+                placeholder="send <file-path> | status | help | resume | quit",
+                id="command-input",
+                suggester=self._suggester,
+            )
         yield Footer()
 
     def on_mount(self) -> None:
@@ -1192,6 +1446,11 @@ class UDPApp(App[None]):
 
     def on_unmount(self) -> None:
         self.runtime.ui.unbind(self)
+        self._completion_request_id += 1
+        self._pending_tab_value = None
+        self._completion_mode = False
+        self._completion_value = None
+        self._completion_candidates = ()
 
     def _on_resize_width(self, width: int) -> None:
         panels = self.query_one("#panels", Grid)
@@ -1212,6 +1471,209 @@ class UDPApp(App[None]):
             f"Packet log: {safe_one_line(cfg.packet_log_path)}\n"
             f"Event log:  {safe_one_line(cfg.event_log_path)}"
         )
+
+    def _command_input(self) -> CommandInput:
+        return self.query_one("#command-input", CommandInput)
+
+    def _completion_list(self) -> OptionList:
+        return self.query_one("#completion-list", OptionList)
+
+    def _can_inline_complete(self, value: str) -> bool:
+        if self._completion_mode:
+            return False
+        try:
+            input_widget = self._command_input()
+        except Exception:
+            return False
+        return input_widget.value == value and input_widget.cursor_at_end
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id != "command-input":
+            return
+        input_widget = self._command_input()
+        if event.value != input_widget.value:
+            return
+        if self._completion_mode:
+            if input_widget.cursor_at_end and parse_completion_query(event.value) is not None:
+                self._refresh_completion_options(event.value)
+            else:
+                self._close_completion_mode()
+        else:
+            if self._pending_tab_value == event.value:
+                return
+            # A pending Tab scan must never reopen a list for text that has since changed.
+            self._completion_request_id += 1
+            self._pending_tab_value = None
+
+    def _request_completion_from_tab(self) -> None:
+        input_widget = self._command_input()
+        value = input_widget.value
+        query = parse_completion_query(value)
+        if query is None or not input_widget.cursor_at_end:
+            return
+        self._completion_request_id += 1
+        request_id = self._completion_request_id
+        self._pending_tab_value = value
+
+        async def find_candidates() -> None:
+            results = await asyncio.to_thread(
+                scan_path_candidates,
+                query.path_text,
+                query.command_prefix,
+                query.quote,
+                self._completion_base,
+            )
+            if request_id != self._completion_request_id:
+                return
+            current = self._command_input()
+            if current.value != value or not current.cursor_at_end or self._completion_mode:
+                return
+            self._pending_tab_value = None
+            if not results.candidates:
+                return
+            if len(results.candidates) == 1:
+                self._apply_direct_completion(results.candidates[0])
+                return
+            self._completion_mode = True
+            self._show_completion_results(value, results)
+
+        asyncio.create_task(find_candidates())
+
+    def _refresh_completion_options(self, value: str) -> None:
+        query = parse_completion_query(value)
+        if query is None:
+            self._close_completion_mode()
+            return
+        self._completion_request_id += 1
+        request_id = self._completion_request_id
+        self._completion_value = None
+
+        async def find_candidates() -> None:
+            results = await asyncio.to_thread(
+                scan_path_candidates,
+                query.path_text,
+                query.command_prefix,
+                query.quote,
+                self._completion_base,
+            )
+            if request_id != self._completion_request_id or not self._completion_mode:
+                return
+            current = self._command_input()
+            if current.value != value or not current.cursor_at_end:
+                return
+            if not results.candidates:
+                self._close_completion_mode()
+                return
+            self._show_completion_results(value, results)
+
+        asyncio.create_task(find_candidates())
+
+    def _show_completion_results(self, value: str, results: CompletionResults) -> None:
+        option_list = self._completion_list()
+        options = [Option(candidate.label, id=f"path-{index}") for index, candidate in enumerate(results.candidates)]
+        if results.truncated:
+            options.append(Option("More than 200 results; type more of the path to narrow the list", disabled=True))
+        option_list.set_options(options)
+        option_list.highlighted = 0
+        option_list.styles.display = "block"
+        self._completion_candidates = results.candidates
+        self._completion_truncated = results.truncated
+        self._completion_value = value
+
+    def _close_completion_mode(self) -> None:
+        self._completion_request_id += 1
+        self._pending_tab_value = None
+        self._completion_mode = False
+        self._completion_value = None
+        self._completion_candidates = ()
+        self._completion_truncated = False
+        if self.is_mounted:
+            option_list = self._completion_list()
+            option_list.clear_options()
+            option_list.styles.display = "none"
+
+    def _cancel_completion(self) -> None:
+        # Also invalidate a Tab lookup that is still running before the list opens.
+        self._close_completion_mode()
+        input_widget = self._command_input()
+        if input_widget.suggester is not None and input_widget.cursor_at_end and input_widget.value:
+            input_widget._suggestion = ""
+            input_widget.run_worker(input_widget.suggester._get_suggestion(input_widget, input_widget.value))
+
+    def _move_completion(self, direction: int) -> None:
+        if not self._completion_mode or self._completion_value != self._command_input().value:
+            return
+        option_list = self._completion_list()
+        if direction < 0:
+            option_list.action_cursor_up()
+        else:
+            option_list.action_cursor_down()
+
+    def _accept_completion(self) -> None:
+        if not self._completion_mode or self._completion_value != self._command_input().value:
+            return
+        option_list = self._completion_list()
+        index = option_list.highlighted
+        if index is None or index < 0 or index >= len(self._completion_candidates):
+            return
+        candidate = self._completion_candidates[index]
+        input_widget = self._command_input()
+        self._completion_request_id += 1
+        self._completion_candidates = ()
+        self._completion_value = None
+        option_list.clear_options()
+        if candidate.is_directory:
+            # Keep selection mode open while offering entries below the selected directory.
+            self._completion_mode = True
+            input_widget.value = candidate.value
+            input_widget.cursor_position = len(input_widget.value)
+        else:
+            self._completion_mode = False
+            self._completion_truncated = False
+            option_list.styles.display = "none"
+            input_widget.value = candidate.value
+            input_widget.cursor_position = len(input_widget.value)
+
+    def _apply_direct_completion(self, candidate: CompletionCandidate) -> None:
+        input_widget = self._command_input()
+        self._completion_request_id += 1
+        self._pending_tab_value = None
+        input_widget.value = candidate.value
+        input_widget.cursor_position = len(input_widget.value)
+
+    def _history_up(self) -> None:
+        if not self._history:
+            return
+        input_widget = self._command_input()
+        if self._history_index is None:
+            self._history_draft = input_widget.value
+            self._history_index = len(self._history) - 1
+        elif self._history_index > 0:
+            self._history_index -= 1
+        input_widget.value = self._history[self._history_index]
+        input_widget.cursor_position = len(input_widget.value)
+
+    def _history_down(self) -> None:
+        if self._history_index is None:
+            return
+        input_widget = self._command_input()
+        if self._history_index < len(self._history) - 1:
+            self._history_index += 1
+            input_widget.value = self._history[self._history_index]
+        else:
+            input_widget.value = self._history_draft
+            self._history_index = None
+        input_widget.cursor_position = len(input_widget.value)
+
+    def _record_command_history(self, command: str) -> None:
+        if not command.strip():
+            return
+        if not self._history or self._history[-1] != command:
+            self._history.append(command)
+            if len(self._history) > COMMAND_HISTORY_LIMIT:
+                del self._history[: len(self._history) - COMMAND_HISTORY_LIMIT]
+        self._history_index = None
+        self._history_draft = ""
 
     def refresh_from_workers(
         self,
@@ -1271,6 +1733,7 @@ class UDPApp(App[None]):
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         command = event.value
+        self._record_command_history(command)
         event.input.value = ""
         self._handle_command(command)
 
@@ -1301,7 +1764,9 @@ class UDPApp(App[None]):
         elif command == "help":
             self._append_command_message(
                 "Commands: send <file-path> (spaces are part of the path; quote to preserve leading/trailing spaces), "
-                "status, help, resume, quit."
+                "status, help, resume, quit. Up/Down recalls commands; Tab completes send paths. "
+                "With multiple matches, Up/Down selects and Enter/Tab/Right accepts; press Enter again to send. "
+                "Esc closes the candidate list."
             )
         elif command == "resume":
             if self.runtime.sender.resume():
