@@ -36,6 +36,7 @@ DEFAULT_PACKET_QUEUE_PACKETS = 4_096
 DEFAULT_RECEIVE_BUFFER_BYTES = 4 * 1024 * 1024
 LINUX_SO_RXQ_OVFL = 40
 MAX_WAIT_MS = 1_800_000
+MAX_REPEAT_COUNT = 10_000
 FLUSH_INTERVAL_SECONDS = 1.0
 FLUSH_LINE_COUNT = 256
 UI_MAX_EVENTS = 100
@@ -681,6 +682,34 @@ def parse_send_path(command: str) -> Path:
     return Path(path_text)
 
 
+def parse_repeat_count(value: str) -> int:
+    """Parse the bounded ASCII decimal count accepted by ``sendrep``."""
+    if not value or not value.isascii() or not value.isdecimal():
+        raise ValueError("repeat count must be an ASCII decimal integer from 1 through 10000")
+    significant = value.lstrip("0") or "0"
+    if len(significant) > 5 or (len(significant) == 5 and significant > "10000"):
+        raise ValueError("repeat count must be an integer from 1 through 10000")
+    count = int(significant)
+    if count < 1:
+        raise ValueError("repeat count must be an integer from 1 through 10000")
+    return count
+
+
+def parse_sendrep_command(command: str) -> tuple[int, Path]:
+    """Parse ``sendrep <count> <path>`` while keeping the path as one value."""
+    if not command.startswith("sendrep") or len(command) == 7 or not command[7].isspace():
+        raise ValueError("usage: sendrep <num> <file-path>")
+    remainder = command[7:].lstrip()
+    separator = next((index for index, character in enumerate(remainder) if character.isspace()), None)
+    if separator is None:
+        raise ValueError("usage: sendrep <num> <file-path>")
+    count_text = remainder[:separator]
+    path_remainder = remainder[separator:]
+    count = parse_repeat_count(count_text)
+    path = parse_send_path("send" + path_remainder)
+    return count, path
+
+
 @dataclass(frozen=True)
 class CompletionCandidate:
     value: str
@@ -702,10 +731,25 @@ class CompletionQuery:
 
 
 def parse_completion_query(value: str) -> CompletionQuery | None:
-    """Return the send path being edited, if the whole input is a completable send."""
-    if not value.startswith("send") or len(value) == 4 or not value[4].isspace():
+    """Return the send/send-repeat path being edited, if it is completable."""
+    if value.startswith("sendrep") and len(value) > 7 and value[7].isspace():
+        remainder_start = 7
+        while remainder_start < len(value) and value[remainder_start].isspace():
+            remainder_start += 1
+        count_end = remainder_start
+        while count_end < len(value) and not value[count_end].isspace():
+            count_end += 1
+        try:
+            parse_repeat_count(value[remainder_start:count_end])
+        except ValueError:
+            return None
+        if count_end == len(value):
+            return None
+        path_start = count_end
+    elif value.startswith("send") and len(value) > 4 and value[4].isspace():
+        path_start = 4
+    else:
         return None
-    path_start = 4
     while path_start < len(value) and value[path_start].isspace():
         path_start += 1
     raw_path = value[path_start:]
@@ -906,6 +950,8 @@ class CompletionOptionList(OptionList):
 @dataclass(frozen=True)
 class SendJob:
     path: Path
+    repetitions: int = 1
+    repeat_job: bool = False
 
 
 class SenderWorker:
@@ -916,22 +962,39 @@ class SenderWorker:
         self._thread = threading.Thread(target=self._run, name="udp-sender", daemon=True)
         self._stopping = False
         self._paused = False
-        self._current_path: Path | None = None
+        self._active_job: SendJob | None = None
+        self._active_cancel: threading.Event | None = None
+        self._current_repetition = 0
         self._current_line = 0
+        self._last_stopped_path: Path | None = None
+        self._last_stopped_line: int | None = None
+        self._last_stopped_repetition: int | None = None
+        self._last_stopped_repetitions: int | None = None
+        self._last_stopped_repeat_job = False
         self._last_failed_path: Path | None = None
         self._last_failed_line: int | None = None
         self._completed = 0
         self._failed = 0
+        self._stopped = 0
+        self._discarded = 0
         self._sent_datagrams = 0
 
     def start(self) -> None:
         self._thread.start()
 
-    def enqueue(self, path: Path) -> int:
+    def enqueue(
+        self,
+        path: Path,
+        repetitions: int = 1,
+        *,
+        repeat_job: bool | None = None,
+    ) -> int:
+        if not 1 <= repetitions <= MAX_REPEAT_COUNT:
+            raise ValueError("repeat count must be an integer from 1 through 10000")
         with self._condition:
             if self._stopping:
                 raise RuntimeError("application is shutting down")
-            self._jobs.append(SendJob(path))
+            self._jobs.append(SendJob(path, repetitions, repetitions > 1 if repeat_job is None else repeat_job))
             count = len(self._jobs)
             self._condition.notify()
             return count
@@ -944,17 +1007,43 @@ class SenderWorker:
             self._condition.notify_all()
             return True
 
-    def request_stop(self) -> tuple[int, Path | None, int]:
+    def stop(self) -> dict[str, object]:
+        """Cancel the current job and discard the queue without stopping the worker."""
         with self._condition:
             if self._stopping:
-                return 0, self._current_path, self._current_line
+                return self._stop_snapshot(0)
             dropped = len(self._jobs)
             self._jobs.clear()
-            self._stopping = True
-            current_path = self._current_path
-            current_line = self._current_line
+            self._discarded += dropped
+            self._paused = False
+            if self._active_cancel is not None:
+                self._active_cancel.set()
             self._condition.notify_all()
-            return dropped, current_path, current_line
+            return self._stop_snapshot(dropped)
+
+    def request_shutdown(self) -> dict[str, object]:
+        """Stop the worker permanently as part of full application shutdown."""
+        with self._condition:
+            dropped = len(self._jobs)
+            self._jobs.clear()
+            self._paused = False
+            self._stopping = True
+            if self._active_cancel is not None:
+                self._active_cancel.set()
+            self._condition.notify_all()
+            return self._stop_snapshot(dropped)
+
+    def _stop_snapshot(self, dropped: int) -> dict[str, object]:
+        job = self._active_job
+        return {
+            "dropped": dropped,
+            "active": job is not None,
+            "path": str(job.path) if job is not None else None,
+            "line": self._current_line if job is not None else None,
+            "repetition": self._current_repetition if job is not None else None,
+            "repetitions": job.repetitions if job is not None else None,
+            "repeat_job": job.repeat_job if job is not None else False,
+        }
 
     def join(self) -> None:
         if self._thread.ident is not None:
@@ -962,23 +1051,39 @@ class SenderWorker:
 
     def snapshot(self) -> dict[str, object]:
         with self._condition:
-            if self._stopping:
+            if self._stopping or (self._active_cancel is not None and self._active_cancel.is_set()):
                 state = "stopping"
             elif self._paused:
                 state = "paused"
-            elif self._current_path is not None:
+            elif self._active_job is not None:
                 state = "sending"
             else:
                 state = "idle"
             return {
                 "state": state,
-                "current_path": str(self._current_path) if self._current_path else None,
+                "current_path": str(self._active_job.path) if self._active_job else None,
                 "current_line": self._current_line,
+                "current_repetition": (
+                    self._current_repetition if self._active_job and self._active_job.repeat_job else None
+                ),
+                "current_repetitions": (
+                    self._active_job.repetitions if self._active_job and self._active_job.repeat_job else None
+                ),
                 "last_failed_path": str(self._last_failed_path) if self._last_failed_path else None,
                 "last_failed_line": self._last_failed_line,
+                "last_stopped_path": str(self._last_stopped_path) if self._last_stopped_path else None,
+                "last_stopped_line": self._last_stopped_line,
+                "last_stopped_repetition": (
+                    self._last_stopped_repetition if self._last_stopped_repeat_job else None
+                ),
+                "last_stopped_repetitions": (
+                    self._last_stopped_repetitions if self._last_stopped_repeat_job else None
+                ),
                 "queued": len(self._jobs),
                 "completed": self._completed,
                 "failed": self._failed,
+                "stopped": self._stopped,
+                "discarded": self._discarded,
                 "sent_datagrams": self._sent_datagrams,
             }
 
@@ -989,54 +1094,104 @@ class SenderWorker:
                 if self._stopping:
                     return
                 job = self._jobs.popleft()
-                self._current_path = job.path
+                cancel_event = threading.Event()
+                self._active_job = job
+                self._active_cancel = cancel_event
+                self._current_repetition = 1
                 self._current_line = 0
-            self.engine.log("info", f"send started: {job.path}")
+            start_message = f"send started: {job.path}"
+            if job.repeat_job:
+                start_message += f"; repetitions={job.repetitions}"
+            self.engine.log("info", start_message)
             error: SendFileError | None = None
-            try:
-                self._process_file(job.path)
-            except SendFileError as exc:
-                error = exc
-            except OSError as exc:
-                error = SendFileError(max(1, self._current_line), f"file I/O failed: {safe_one_line(exc)}")
-            except Exception as exc:
-                error = SendFileError(max(1, self._current_line), f"send processing failed: {safe_one_line(exc)}")
+            error_repetition = 1
+            for repetition in range(1, job.repetitions + 1):
+                with self._condition:
+                    self._current_repetition = repetition
+                    self._current_line = 0
+                    cancelled_before_repetition = cancel_event.is_set() or self.engine.stop_event.is_set()
+                if cancelled_before_repetition:
+                    break
+                try:
+                    self._process_file(job.path, cancel_event)
+                except SendFileError as exc:
+                    error = exc
+                    error_repetition = repetition
+                    break
+                except OSError as exc:
+                    error = SendFileError(max(1, self._current_line), f"file I/O failed: {safe_one_line(exc)}")
+                    error_repetition = repetition
+                    break
+                except Exception as exc:
+                    error = SendFileError(max(1, self._current_line), f"send processing failed: {safe_one_line(exc)}")
+                    error_repetition = repetition
+                    break
+                if cancel_event.is_set() or self.engine.stop_event.is_set():
+                    break
             with self._condition:
-                if self._stopping or self.engine.failures.event.is_set():
-                    self._current_path = None
-                    self._current_line = 0
+                if self.engine.failures.event.is_set():
+                    self._clear_active()
                     return
-                if error is None:
+                if self._stopping:
+                    self._clear_active()
+                    return
+                if cancel_event.is_set() or self.engine.stop_event.is_set():
+                    self._stopped += 1
+                    self._last_stopped_path = job.path
+                    self._last_stopped_line = self._current_line
+                    self._last_stopped_repetition = self._current_repetition
+                    self._last_stopped_repetitions = job.repetitions
+                    self._last_stopped_repeat_job = job.repeat_job
+                    outcome = "stopped"
+                elif error is None:
                     self._completed += 1
-                    self._current_path = None
-                    self._current_line = 0
-                    completed = True
+                    outcome = "completed"
                 else:
                     self._failed += 1
                     self._last_failed_path = job.path
                     self._last_failed_line = error.line_number
                     self._paused = True
-                    self._current_path = None
-                    self._current_line = 0
-                    completed = False
-            if completed:
-                self.engine.log("info", f"send file completed: {job.path}")
+                    outcome = "failed"
+                self._clear_active()
+            if outcome == "completed":
+                suffix = f"; repetitions={job.repetitions}" if job.repeat_job else ""
+                self.engine.log("info", f"send file completed: {job.path}{suffix}")
+            elif outcome == "stopped":
+                stop_position = (
+                    f"; repetition={self._last_stopped_repetition}/{self._last_stopped_repetitions}"
+                    if job.repeat_job
+                    else ""
+                )
+                self.engine.log(
+                    "info",
+                    f"send job stopped: {job.path}{stop_position}; line={self._last_stopped_line}",
+                )
             else:
+                assert error is not None
+                position = f"; repetition {error_repetition}/{job.repetitions}" if job.repeat_job else ""
                 if str(error).startswith("UDP send failed ("):
-                    event_message = f"{safe_one_line(error)}; file {job.path} line {error.line_number}"
+                    event_message = f"{safe_one_line(error)}; file {job.path}{position} line {error.line_number}"
                 else:
-                    event_message = f"{job.path} line {error.line_number}: {safe_one_line(error)}"
+                    event_message = f"{job.path}{position} line {error.line_number}: {safe_one_line(error)}"
                 self.engine.log("error", event_message)
             self.engine.ui.request_refresh()
 
-    def _process_file(self, path: Path) -> None:
+    def _clear_active(self) -> None:
+        self._active_job = None
+        self._active_cancel = None
+        self._current_repetition = 0
+        self._current_line = 0
+
+    def _process_file(self, path: Path, cancel_event: threading.Event) -> None:
         line_number = 0
         try:
             source = path.open("r", encoding="utf-8", newline=None)
         except OSError as exc:
             raise SendFileError(1, f"unable to open file: {safe_one_line(exc)}") from exc
         with source:
-            while not self.engine.stop_event.is_set() and not self.engine.failures.event.is_set():
+            while not self.engine.failures.event.is_set():
+                if cancel_event.is_set() or self.engine.stop_event.is_set():
+                    return
                 try:
                     line = source.readline()
                 except (OSError, UnicodeError) as exc:
@@ -1046,11 +1201,13 @@ class SenderWorker:
                 line_number += 1
                 with self._condition:
                     self._current_line = line_number
+                if cancel_event.is_set() or self.engine.stop_event.is_set():
+                    return
                 operation, value = parse_payload_line(line.rstrip("\r\n"), line_number)
                 if operation == "ignore":
                     continue
                 if operation == "wait":
-                    if self.engine.stop_event.wait(int(value) / 1000) or self.engine.failures.event.is_set():
+                    if cancel_event.wait(int(value) / 1000) or self.engine.stop_event.is_set():
                         return
                     continue
                 payload = value
@@ -1272,13 +1429,36 @@ class Runtime:
     def request_stop(self) -> None:
         self.stop_event.set()
         self.receive_stop.set()
-        dropped, current_path, current_line = self.sender.request_stop()
-        stopped = f"{current_path} line {current_line}" if current_path else "none"
+        details = self.sender.request_shutdown()
+        stopped = self._format_stop_target(details)
         self.log(
             "info",
-            f"shutdown requested; discarded queued files={dropped}; stopped file={stopped}",
+            f"shutdown requested; discarded queued jobs={details['dropped']}; stopped file={stopped}",
             block=False,
         )
+
+    @staticmethod
+    def _format_stop_target(details: dict[str, object]) -> str:
+        if not details["active"]:
+            return "none"
+        path = details["path"]
+        line = details["line"]
+        position = (
+            f" repetition={details['repetition']}/{details['repetitions']}"
+            if details["repeat_job"]
+            else ""
+        )
+        return f"{path}{position} line={line}"
+
+    def stop_sending(self) -> None:
+        details = self.sender.stop()
+        self.log(
+            "info",
+            f"send stop requested; discarded queued jobs={details['dropped']}; "
+            f"active file={self._format_stop_target(details)}",
+            block=False,
+        )
+        self.ui.request_refresh()
 
     def shutdown(self) -> None:
         with self._shutdown_lock:
@@ -1425,7 +1605,7 @@ class UDPApp(App[None]):
         with Vertical(id="command-area"):
             yield CompletionOptionList(id="completion-list", markup=False)
             yield CommandInput(
-                placeholder="send <file-path> | status | help | resume | quit",
+                placeholder="send <file-path> | sendrep <num> <file-path> | status | stop | help | resume | quit",
                 id="command-input",
                 suggester=self._suggester,
             )
@@ -1709,16 +1889,40 @@ class UDPApp(App[None]):
         buffer_state = f"requested {stats['socket_buffer_requested']}, effective {effective}"
         if stats["socket_buffer_error"]:
             buffer_state += f"; setting error: {stats['socket_buffer_error']}"
-        current = safe_one_line(stats["current_path"] or stats["last_failed_path"] or "none")
-        line = stats["current_line"] or stats["last_failed_line"] or "-"
+        current_path = safe_one_line(stats["current_path"] or "none")
+        current_line = stats["current_line"] or "-"
+        current_repeat = (
+            f"{stats['current_repetition']}/{stats['current_repetitions']}"
+            if stats["current_repetition"] is not None
+            else "-"
+        )
+        last_failed = (
+            f"{safe_one_line(stats['last_failed_path'])} line {stats['last_failed_line']}"
+            if stats["last_failed_path"]
+            else "none"
+        )
+        last_stopped = (
+            f"{safe_one_line(stats['last_stopped_path'])}"
+            + (
+                f" repetition {stats['last_stopped_repetition']}/{stats['last_stopped_repetitions']}"
+                if stats["last_stopped_repetition"] is not None
+                else ""
+            )
+            + " "
+            f"line {stats['last_stopped_line']}"
+            if stats["last_stopped_path"]
+            else "none"
+        )
         text = (
             f"RX: {stats['receive_state']} | Received: {stats['received']} | RX errors: {stats['rx_errors']}\n"
             f"Packet logs written: {stats['written']} | Log queue dropped: {stats['dropped']}\n"
             f"Log queue: {stats['depth']} packets / {stats['bytes']} bytes "
             f"(max {stats['max_depth']} packets / {stats['max_bytes']} bytes)\n"
             f"OS UDP drops: {os_drops} | SO_RCVBUF: {buffer_state}\n"
-            f"TX: {stats['state']} | File: {current} | Line: {line}\n"
-            f"Queued files: {stats['queued']} | Completed: {stats['completed']} | Failed: {stats['failed']} | "
+            f"TX: {stats['state']} | File: {current_path} | Line: {current_line} | Repeat: {current_repeat}\n"
+            f"Last failed: {last_failed}\nLast stopped: {last_stopped}\n"
+            f"Queued jobs: {stats['queued']} | Completed: {stats['completed']} | Failed: {stats['failed']} | "
+            f"Stopped: {stats['stopped']} | Discarded: {stats['discarded']} | "
             f"Datagrams sent: {stats['sent_datagrams']}"
         )
         self.query_one("#status-text", Static).update(text)
@@ -1742,17 +1946,24 @@ class UDPApp(App[None]):
         if not command.strip():
             return
         command_name = command.split(None, 1)[0]
-        if command_name == "send":
+        if command_name in {"send", "sendrep"}:
             try:
-                path = parse_send_path(command)
+                if command_name == "sendrep":
+                    repetitions, path = parse_sendrep_command(command)
+                else:
+                    repetitions = 1
+                    path = parse_send_path(command)
                 if not path.is_file():
                     raise ValueError("path is not a regular file")
                 with path.open("rb"):
                     pass
-                queued = self.runtime.sender.enqueue(path.resolve())
+                path = path.resolve()
+                repeat_job = command_name == "sendrep"
+                queued = self.runtime.sender.enqueue(path, repetitions, repeat_job=repeat_job)
+                repeat_suffix = f"; repetitions={repetitions}" if repeat_job else ""
                 self.runtime.log(
                     "info",
-                    f"file queued: {path.resolve()} (queued files={queued})",
+                    f"file queued: {path}{repeat_suffix} (queued jobs={queued})",
                     block=False,
                 )
             except (OSError, ValueError, RuntimeError) as exc:
@@ -1763,11 +1974,15 @@ class UDPApp(App[None]):
             self._append_command_message("Status refreshed.")
         elif command == "help":
             self._append_command_message(
-                "Commands: send <file-path> (spaces are part of the path; quote to preserve leading/trailing spaces), "
-                "status, help, resume, quit. Up/Down recalls commands; Tab completes send paths. "
+                "Commands: send <file-path>, sendrep <num> <file-path> (num 1-10000; spaces are part of the path; "
+                "quote to preserve leading/trailing spaces), status, stop, help, resume, quit. "
+                "Up/Down recalls commands; Tab completes send and sendrep paths. "
                 "With multiple matches, Up/Down selects and Enter/Tab/Right accepts; press Enter again to send. "
                 "Esc closes the candidate list."
             )
+        elif command == "stop":
+            self.runtime.stop_sending()
+            self._append_command_message("Send stop requested; queued jobs were discarded.")
         elif command == "resume":
             if self.runtime.sender.resume():
                 self.runtime.log("info", "send queue resumed", block=False)

@@ -27,7 +27,10 @@ from udpcomapp import (  # noqa: E402
     create_runtime,
     main,
     parse_payload_line,
+    parse_completion_query,
+    parse_repeat_count,
     parse_send_path,
+    parse_sendrep_command,
     scan_path_candidates,
 )
 from textual.containers import Grid  # noqa: E402
@@ -86,6 +89,40 @@ class PayloadParserTests(unittest.TestCase):
         self.assertEqual(parse_send_path("send '  spaced name.txt  '"), Path("  spaced name.txt  "))
         with self.assertRaisesRegex(ValueError, "unmatched quote"):
             parse_send_path('send "unfinished')
+
+    def test_sendrep_count_bounds_path_syntax_and_completion_prefix(self) -> None:
+        for source, expected in (("1", 1), ("0003", 3), ("10000", 10_000)):
+            self.assertEqual(parse_repeat_count(source), expected)
+        for source in ("", "0", "-1", "+2", "1.5", "10001", "١", "9" * 5000):
+            with self.subTest(source=source[:20]), self.assertRaises(ValueError):
+                parse_repeat_count(source)
+
+        self.assertEqual(
+            parse_sendrep_command('sendrep 0003 "./folder with spaces/file.txt"'),
+            (3, Path("./folder with spaces/file.txt")),
+        )
+        self.assertEqual(parse_sendrep_command("sendrep 1 file.txt"), (1, Path("file.txt")))
+        self.assertEqual(
+            parse_sendrep_command("sendrep 2 ./folder with spaces/file.txt"),
+            (2, Path("./folder with spaces/file.txt")),
+        )
+        for command in (
+            "sendrep",
+            "sendrep 3",
+            "sendrep 0 file.txt",
+            "sendrep -2 file.txt",
+            "sendrep +2 file.txt",
+            "sendrep 10001 file.txt",
+            "sendrep 2 'unfinished",
+        ):
+            with self.subTest(command=command), self.assertRaises(ValueError):
+                parse_sendrep_command(command)
+
+        query = parse_completion_query('sendrep 3 "folder/fi')
+        self.assertIsNotNone(query)
+        self.assertEqual(query.command_prefix, "sendrep 3 ")
+        self.assertEqual(query.path_text, "folder/fi")
+        self.assertIsNone(parse_completion_query("sendrep +3 folder/fi"))
 
     def test_path_completion_quotes_hidden_names_and_dot_directories(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -380,6 +417,128 @@ class RuntimeLoopbackTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("bad.txt line 2", event_log)
                 self.assertNotIn("XYZ", event_log)
 
+    async def test_sendrep_is_one_contiguous_fifo_job_with_per_repeat_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as destination:
+                destination.bind(("127.0.0.1", 0))
+                destination.settimeout(1)
+                runtime = create_runtime(write_settings(directory, destination.getsockname()[1]))
+                repeated = directory / "repeat.txt"
+                following = directory / "following.txt"
+                repeated.write_text("CAFE\nBEEF\n", encoding="utf-8")
+                following.write_text("1234\n", encoding="utf-8")
+                self.assertEqual(runtime.sender.enqueue(repeated, 3, repeat_job=True), 1)
+                self.assertEqual(runtime.sender.enqueue(following), 2)
+                try:
+                    runtime.start()
+                    packets = []
+                    for _ in range(7):
+                        payload, _peer = await asyncio.to_thread(destination.recvfrom, 100)
+                        packets.append(payload.hex().upper())
+                    self.assertTrue(await wait_until(lambda: runtime.sender.snapshot()["completed"] == 2))
+                finally:
+                    runtime.shutdown()
+
+                self.assertEqual(packets, ["CAFE", "BEEF"] * 3 + ["1234"])
+                event_log = (directory / "events.log").read_text(encoding="utf-8")
+                self.assertIn(f"send started: {repeated}; repetitions=3", event_log)
+                self.assertIn(f"send file completed: {repeated}; repetitions=3", event_log)
+
+    async def test_sendrep_later_repetition_error_fails_job_then_resume_runs_next_job(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as destination:
+                destination.bind(("127.0.0.1", 0))
+                destination.settimeout(1)
+                runtime = create_runtime(write_settings(directory, destination.getsockname()[1]))
+                repeated = directory / "repeat.txt"
+                replacement = directory / "replacement.txt"
+                following = directory / "following.txt"
+                repeated.write_text("CAFE\n/Wait 250\n", encoding="utf-8")
+                replacement.write_text("BEEF\nXYZ\n", encoding="utf-8")
+                following.write_text("1234\n", encoding="utf-8")
+                runtime.sender.enqueue(repeated, 3, repeat_job=True)
+                runtime.sender.enqueue(following)
+                try:
+                    runtime.start()
+                    first, _peer = await asyncio.to_thread(destination.recvfrom, 100)
+                    self.assertEqual(first, bytes.fromhex("CAFE"))
+                    self.assertTrue(await wait_until(lambda: runtime.sender.snapshot()["current_line"] == 2))
+                    replacement.replace(repeated)
+                    second, _peer = await asyncio.to_thread(destination.recvfrom, 100)
+                    self.assertEqual(second, bytes.fromhex("BEEF"))
+                    self.assertTrue(await wait_until(lambda: runtime.sender.snapshot()["state"] == "paused"))
+                    state = runtime.sender.snapshot()
+                    self.assertEqual(state["failed"], 1)
+                    self.assertEqual(state["queued"], 1)
+                    self.assertTrue(runtime.sender.resume())
+                    third, _peer = await asyncio.to_thread(destination.recvfrom, 100)
+                    self.assertEqual(third, bytes.fromhex("1234"))
+                    self.assertTrue(await wait_until(lambda: runtime.sender.snapshot()["completed"] == 1))
+                finally:
+                    runtime.shutdown()
+                event_log = (directory / "events.log").read_text(encoding="utf-8")
+                self.assertIn(f"{repeated}; repetition 2/3 line 2", event_log)
+                self.assertNotIn("XYZ", event_log)
+
+    async def test_stop_interrupts_wait_discards_queue_keeps_receiver_and_accepts_new_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as destination:
+                destination.bind(("127.0.0.1", 0))
+                destination.settimeout(0.2)
+                runtime = create_runtime(write_settings(directory, destination.getsockname()[1]))
+                wait_file = directory / "wait.txt"
+                queued_file = directory / "queued.txt"
+                following_file = directory / "following.txt"
+                wait_file.write_text("/Wait 120000\nABCD\n", encoding="utf-8")
+                queued_file.write_text("BEEF\n", encoding="utf-8")
+                following_file.write_text("CAFE\n", encoding="utf-8")
+                inbound = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                runtime.start()
+                try:
+                    runtime.sender.enqueue(wait_file, 3, repeat_job=True)
+                    runtime.sender.enqueue(queued_file)
+                    self.assertTrue(
+                        await wait_until(
+                            lambda: runtime.sender.snapshot()["current_line"] == 1
+                            and runtime.sender.snapshot()["state"] == "sending"
+                        )
+                    )
+                    started = time.monotonic()
+                    runtime.stop_sending()
+                    self.assertLess(time.monotonic() - started, 0.5)
+                    state = runtime.sender.snapshot()
+                    self.assertEqual(state["queued"], 0)
+                    self.assertEqual(state["discarded"], 1)
+                    self.assertTrue(await wait_until(lambda: runtime.sender.snapshot()["stopped"] == 1))
+
+                    inbound.sendto(b"still receiving", runtime.sock.getsockname())
+                    self.assertTrue(await wait_until(lambda: runtime.snapshot()["received"] == 1))
+                    self.assertEqual(runtime.sender.snapshot()["state"], "idle")
+
+                    runtime.sender.enqueue(following_file)
+                    received, _peer = await asyncio.to_thread(destination.recvfrom, 100)
+                    self.assertEqual(received, bytes.fromhex("CAFE"))
+                    self.assertTrue(await wait_until(lambda: runtime.sender.snapshot()["completed"] == 1))
+                    with self.assertRaises(socket.timeout):
+                        await asyncio.to_thread(destination.recvfrom, 100)
+                finally:
+                    runtime.shutdown()
+                    inbound.close()
+
+                state = runtime.sender.snapshot()
+                self.assertEqual(state["stopped"], 1)
+                self.assertEqual(state["discarded"], 1)
+                self.assertEqual(state["last_stopped_path"], str(wait_file))
+                self.assertEqual(state["last_stopped_repetition"], 1)
+                event_log = (directory / "events.log").read_text(encoding="utf-8")
+                self.assertIn("send stop requested; discarded queued jobs=1", event_log)
+                self.assertIn(f"active file={wait_file} repetition=1/3 line=1", event_log)
+                self.assertIn(f"send job stopped: {wait_file}; repetition=1/3; line=1", event_log)
+                self.assertIn("shutdown summary: received=1", event_log)
+
     async def test_quit_interrupts_wait_and_drops_queued_files(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -401,7 +560,7 @@ class RuntimeLoopbackTests(unittest.IsolatedAsyncioTestCase):
                 self.assertLess(time.monotonic() - started, 1.0)
                 self.assertEqual(runtime.sender.snapshot()["queued"], 0)
                 event_log = (directory / "events.log").read_text(encoding="utf-8")
-                self.assertIn("discarded queued files=1", event_log)
+                self.assertIn("discarded queued jobs=1", event_log)
 
 
 class TextualPilotTests(unittest.IsolatedAsyncioTestCase):
@@ -465,6 +624,19 @@ class TextualPilotTests(unittest.IsolatedAsyncioTestCase):
                         self.assertTrue(await wait_until(lambda: bool(command._suggestion)))
                         await pilot.press("right")
                         self.assertEqual(command.value, "send alpha one.txt")
+
+                        command.value = "sendrep 3 al"
+                        command.cursor_position = len(command.value)
+                        self.assertTrue(await wait_until(lambda: bool(command._suggestion)))
+                        self.assertEqual(command._suggestion, "sendrep 3 alpha one.txt")
+                        await pilot.press("tab")
+                        self.assertTrue(await wait_until(lambda: app._completion_mode))
+                        self.assertEqual(len(app._completion_candidates), 2)
+                        self.assertTrue(all(item.value.startswith("sendrep 3 ") for item in app._completion_candidates))
+                        await pilot.press("down")
+                        await pilot.press("enter")
+                        self.assertEqual(command.value, "sendrep 3 alpha-two.txt")
+                        self.assertFalse(app._completion_mode)
 
                         command.value = "send al"
                         command.cursor_position = len(command.value)
@@ -624,11 +796,30 @@ class TextualPilotTests(unittest.IsolatedAsyncioTestCase):
                 try:
                     async with app.run_test(size=(110, 35)) as pilot:
                         command = app.query_one("#command-input")
+                        command.value = f'sendrep 0 "{payload_path}"'
+                        await pilot.press("enter")
+                        self.assertEqual(runtime.sender.snapshot()["queued"], 0)
+
                         command.value = f'send "{payload_path}"'
                         await pilot.press("enter")
                         sent, _ = await asyncio.to_thread(destination.recvfrom, 100)
                         self.assertEqual(sent, bytes.fromhex("DEADBEEF"))
                         self.assertTrue(await wait_until(lambda: runtime.sender.snapshot()["completed"] == 1))
+
+                        command.value = f'sendrep 1 "{payload_path}"'
+                        await pilot.press("enter")
+                        sent, _ = await asyncio.to_thread(destination.recvfrom, 100)
+                        self.assertEqual(sent, bytes.fromhex("DEADBEEF"))
+                        self.assertTrue(await wait_until(lambda: runtime.sender.snapshot()["completed"] == 2))
+
+                        command.value = f'sendrep 2 "{payload_path}"'
+                        await pilot.press("enter")
+                        repeated = [
+                            (await asyncio.to_thread(destination.recvfrom, 100))[0]
+                            for _ in range(2)
+                        ]
+                        self.assertEqual(repeated, [bytes.fromhex("DEADBEEF")] * 2)
+                        self.assertTrue(await wait_until(lambda: runtime.sender.snapshot()["completed"] == 3))
 
                         bad_path = directory / "bad file.txt"
                         bad_path.write_text("XYZ\n", encoding="utf-8")
@@ -638,11 +829,16 @@ class TextualPilotTests(unittest.IsolatedAsyncioTestCase):
                         command.value = f'send "{payload_path}"'
                         await pilot.press("enter")
                         self.assertTrue(await wait_until(lambda: runtime.sender.snapshot()["queued"] == 1))
-                        command.value = "resume"
+                        command.value = "stop"
                         await pilot.press("enter")
-                        resumed_payload, _ = await asyncio.to_thread(destination.recvfrom, 100)
-                        self.assertEqual(resumed_payload, bytes.fromhex("DEADBEEF"))
-                        self.assertTrue(await wait_until(lambda: runtime.sender.snapshot()["completed"] == 2))
+                        self.assertTrue(await wait_until(lambda: runtime.sender.snapshot()["state"] == "idle"))
+                        self.assertEqual(runtime.sender.snapshot()["queued"], 0)
+                        self.assertEqual(runtime.sender.snapshot()["discarded"], 1)
+                        command.value = f'send "{payload_path}"'
+                        await pilot.press("enter")
+                        following_payload, _ = await asyncio.to_thread(destination.recvfrom, 100)
+                        self.assertEqual(following_payload, bytes.fromhex("DEADBEEF"))
+                        self.assertTrue(await wait_until(lambda: runtime.sender.snapshot()["completed"] == 4))
 
                         command.value = "status"
                         inbound.sendto(b"\xca\xfe", runtime.sock.getsockname())
@@ -667,10 +863,62 @@ class TextualPilotTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Received(2): 1: CAFE", packet_log)
             event_log = (directory / "events.log").read_text(encoding="utf-8")
             self.assertIn("Transmitted(4):", event_log)
-            self.assertIn("send queue resumed", event_log)
+            self.assertIn(f"file queued: {payload_path.resolve()}; repetitions=1", event_log)
+            self.assertIn(f"file queued: {payload_path.resolve()}; repetitions=2", event_log)
+            self.assertIn("send stop requested; discarded queued jobs=1", event_log)
             self.assertIn("bad file.txt line 1", event_log)
             self.assertNotIn("DEADBEEF", event_log)
             self.assertNotIn("XYZ", event_log)
+
+    async def test_ctrl_c_shuts_down_during_sendrep_wait_and_discards_queued_job(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as destination:
+                destination.bind(("127.0.0.1", 0))
+                destination.settimeout(0.2)
+                settings_path = write_settings(directory, destination.getsockname()[1])
+                runtime = create_runtime(settings_path)
+                repeating = directory / "repeating.txt"
+                queued = directory / "queued.txt"
+                repeating.write_text("/Wait 120000\nABCD\n", encoding="utf-8")
+                queued.write_text("BEEF\n", encoding="utf-8")
+                inbound = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                app = UDPApp(runtime)
+                try:
+                    async with app.run_test(size=(100, 30)) as pilot:
+                        runtime.sender.enqueue(repeating, 3, repeat_job=True)
+                        runtime.sender.enqueue(queued)
+                        self.assertTrue(
+                            await wait_until(
+                                lambda: runtime.sender.snapshot()["current_line"] == 1
+                                and runtime.sender.snapshot()["state"] == "sending"
+                            )
+                        )
+                        inbound.sendto(b"RX", runtime.sock.getsockname())
+                        self.assertTrue(await wait_until(lambda: runtime.snapshot()["received"] == 1))
+
+                        started = time.monotonic()
+                        await pilot.press("ctrl+c")
+                        self.assertTrue(await wait_until(lambda: not app.is_running, timeout=1.0))
+                        self.assertLess(time.monotonic() - started, 1.0)
+                        self.assertTrue(runtime.receive_stop.is_set())
+                        self.assertEqual(runtime.sender.snapshot()["queued"], 0)
+                finally:
+                    runtime.shutdown()
+                    inbound.close()
+
+                with self.assertRaises(socket.timeout):
+                    await asyncio.to_thread(destination.recvfrom, 100)
+                packet_log = (directory / "received.log").read_text(encoding="utf-8")
+                self.assertIn("Received(2): 1: 5258", packet_log)
+                event_log = (directory / "events.log").read_text(encoding="utf-8")
+                self.assertIn(
+                    f"shutdown requested; discarded queued jobs=1; stopped file={repeating} repetition=1/3 line=1",
+                    event_log,
+                )
+                self.assertIn("shutdown summary: received=1; packet_logs_written=1", event_log)
+                self.assertNotIn("ABCD", event_log)
+                self.assertNotIn("BEEF", event_log)
 
 
 if __name__ == "__main__":
