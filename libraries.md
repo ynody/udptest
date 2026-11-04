@@ -23,3 +23,14 @@
 - バージョン: 1.17.0。
 - 導入方法: プロジェクトとともにダウンロードして利用する。
 - 承認日: 2026-08-18。
+
+## Textual（Python 版 TUI）
+
+- 用途: Python 版統合 UDP アプリのコマンド入力欄、通信状態、直近イベントを表示する TUI。
+- 選定理由: 利用者が既存プロジェクトと同じ TUI ライブラリを指定。非同期イベントとコマンド入力を同じ画面で扱える。
+- 状態: Python 版 TUI 用として選定・承認済み。macOS の uv 環境へ導入し、Python Pilot と loopback 統合テストで確認済み。
+- 承認日: 2026-11-04（利用者が以前のプロジェクトと同じライブラリを指定）。
+- バージョン: 8.2.8（`python/pyproject.toml` と `python/uv.lock` で固定）。ローカル環境は uv 管理の Python 3.14.4。
+- 対応 OS の確認: macOS で確認済み。Windows と Ubuntu Linux の端末入力・再描画は未確認。
+- 代替案: prompt_toolkit、Rich と標準ライブラリ、標準ライブラリのみ。選定理由とトレードオフは `docs/python-integration-specification.md` を参照。
+- 導入方法: `python/pyproject.toml` と `python/uv.lock` を uv で管理する。

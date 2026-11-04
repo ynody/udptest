@@ -1,0 +1,11 @@
+[project]
+name = "udpcomapp"
+version = "0.1.0"
+description = "Integrated IPv4 UDP sender and receiver with a Textual command UI"
+requires-python = ">=3.14,<3.15"
+dependencies = [
+    "textual==8.2.8",
+]
+
+[tool.uv]
+package = false
